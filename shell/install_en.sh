@@ -1477,7 +1477,7 @@ installTools() {
     if echo "${selectCustomInstallType}" | grep -qwE ",7,|,8,|,7,8,|,12,|,7,12,"; then
         echoContent green " ---> Detected services that do not depend on Nginx, skip installation"
     else
-        if ! nginx >/dev/null 2>&1; then
+        if ! command -v nginx >/dev/null 2>&1; then
             echoContent green " ---> Install nginx"
             installNginxTools
         else
@@ -2151,9 +2151,33 @@ selectAcmeInstallSSL() {
     #        fi
     #    fi
 
-    acmeInstallSSL
+    acmeInstallSSL || return 1
 
     readAcmeTLS
+}
+
+# A previous interrupted issue leaves a domain directory without a key. acme.sh then cats that missing key.
+resetIncompleteAcmeDomain() {
+    local domainName=$1
+    local acmeDir="$HOME/.acme.sh/${domainName}_ecc"
+    if [[ -z "${domainName}" || ! -d "${acmeDir}" ]]; then
+        return 0
+    fi
+    if [[ ! -s "${acmeDir}/${domainName}.key" || ! -s "${acmeDir}/${domainName}.cer" ]]; then
+        rm -rf "${acmeDir}"
+    fi
+}
+
+# Standalone issuance must own port 80. A nginx process started from the binary is not tracked by systemd.
+ensureAcmeStandalonePort() {
+    if ! handleNginx stop; then
+        return 1
+    fi
+    if lsof -i "tcp:80" 2>/dev/null | grep -q LISTEN; then
+        echoContent red " ---> Port 80 is still in use, standalone mode cannot issue the certificate"
+        lsof -i "tcp:80" 2>/dev/null | grep LISTEN || true
+        return 1
+    fi
 }
 
 # Install SSL certificate
@@ -2176,6 +2200,10 @@ acmeInstallSSL() {
         sudo Ali_Key="${aliKey}" Ali_Secret="${aliSecret}" "$HOME/.acme.sh/acme.sh" --issue -d "${dnsAPIDomain}" ${dnsAPIExtraDomain} --dns dns_ali -k ec-256 --server "${sslType}" ${sslIPv6} 2>&1 | tee -a /etc/v2ray-agent/tls/acme.log >/dev/null
     else
         echoContent green " ---> Generating certificate"
+        resetIncompleteAcmeDomain "${tlsDomain}"
+        if ! ensureAcmeStandalonePort; then
+            return 1
+        fi
         sudo "$HOME/.acme.sh/acme.sh" --issue -d "${tlsDomain}" --standalone -k ec-256 --server "${sslType}" ${sslIPv6} 2>&1 | tee -a /etc/v2ray-agent/tls/acme.log >/dev/null
     fi
 }
@@ -2285,11 +2313,11 @@ installTLS() {
 
         switchSSLType
         customSSLEmail
-        selectAcmeInstallSSL
+        selectAcmeInstallSSL || return 1
 
         if [[ "${installedDNSAPIStatus}" == "true" ]]; then
             sudo "$HOME/.acme.sh/acme.sh" --installcert -d "*.${dnsTLSDomain}" --fullchainpath "/etc/v2ray-agent/tls/${tlsDomain}.crt" --keypath "/etc/v2ray-agent/tls/${tlsDomain}.key" --ecc >/dev/null
-        else
+        elif [[ -s "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.key" && -s "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.cer" ]]; then
             sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${tlsDomain}" --fullchainpath "/etc/v2ray-agent/tls/${tlsDomain}.crt" --keypath "/etc/v2ray-agent/tls/${tlsDomain}.key" --ecc >/dev/null
         fi
 
@@ -2496,15 +2524,36 @@ handleNginx() {
         fi
         echoContent green " ---> Nginx started successfully"
     elif [[ "$1" == "stop" ]]; then
-        if ! "${nginxStatus[@]}" >/dev/null 2>&1; then
+        if ! "${nginxStatus[@]}" >/dev/null 2>&1 && ! pgrep -x nginx >/dev/null 2>&1; then
             return 0
         fi
-        if ! "${nginxStop[@]}"; then
-            echoContent red " ---> Nginx failed to stop, check the host service status"
-            return 1
+        "${nginxStop[@]}" >/dev/null 2>&1 || true
+        if command -v nginx >/dev/null 2>&1; then
+            nginx -s stop >/dev/null 2>&1 || true
         fi
-        if "${nginxStatus[@]}" >/dev/null 2>&1; then
-            echoContent red " ---> Nginx is still running, check the host service status"
+
+        local retry nginxPids
+        for retry in 1 2 3 4 5; do
+            if ! pgrep -x nginx >/dev/null 2>&1 && ! "${nginxStatus[@]}" >/dev/null 2>&1; then
+                echoContent green " ---> Nginx closed successfully"
+                return 0
+            fi
+            sleep 1
+        done
+
+        nginxPids=$(pgrep -x nginx || true)
+        if [[ -n "${nginxPids}" ]]; then
+            kill ${nginxPids} >/dev/null 2>&1 || true
+            sleep 1
+            nginxPids=$(pgrep -x nginx || true)
+            if [[ -n "${nginxPids}" ]]; then
+                kill -9 ${nginxPids} >/dev/null 2>&1 || true
+                sleep 1
+            fi
+        fi
+
+        if pgrep -x nginx >/dev/null 2>&1 || "${nginxStatus[@]}" >/dev/null 2>&1; then
+            echoContent red " ---> Nginx failed to stop, check the host service status"
             return 1
         fi
         echoContent green " ---> Nginx closed successfully"

@@ -1477,7 +1477,7 @@ installTools() {
     if echo "${selectCustomInstallType}" | grep -qwE ",7,|,8,|,7,8,|,12,|,7,12,"; then
         echoContent green " ---> 检测到无需依赖Nginx的服务，跳过安装"
     else
-        if ! nginx >/dev/null 2>&1; then
+        if ! command -v nginx >/dev/null 2>&1; then
             echoContent green " ---> 安装nginx"
             installNginxTools
         else
@@ -2172,9 +2172,33 @@ selectAcmeInstallSSL() {
     #        fi
     #    fi
 
-    acmeInstallSSL
+    acmeInstallSSL || return 1
 
     readAcmeTLS
+}
+
+# 上次签发中断时会留下没有密钥的目录，acme.sh 会去 cat 这个不存在的 key
+resetIncompleteAcmeDomain() {
+    local domainName=$1
+    local acmeDir="$HOME/.acme.sh/${domainName}_ecc"
+    if [[ -z "${domainName}" || ! -d "${acmeDir}" ]]; then
+        return 0
+    fi
+    if [[ ! -s "${acmeDir}/${domainName}.key" || ! -s "${acmeDir}/${domainName}.cer" ]]; then
+        rm -rf "${acmeDir}"
+    fi
+}
+
+# standalone 申请必须独占 80 端口。直接执行 nginx 二进制拉起的进程不归 systemd 管理。
+ensureAcmeStandalonePort() {
+    if ! handleNginx stop; then
+        return 1
+    fi
+    if lsof -i "tcp:80" 2>/dev/null | grep -q LISTEN; then
+        echoContent red " ---> 80端口仍被占用，standalone模式无法申请证书"
+        lsof -i "tcp:80" 2>/dev/null | grep LISTEN || true
+        return 1
+    fi
 }
 
 # 安装SSL证书
@@ -2197,6 +2221,10 @@ acmeInstallSSL() {
         sudo Ali_Key="${aliKey}" Ali_Secret="${aliSecret}" "$HOME/.acme.sh/acme.sh" --issue -d "${dnsAPIDomain}" ${dnsAPIExtraDomain} --dns dns_ali -k ec-256 --server "${sslType}" ${sslIPv6} 2>&1 | tee -a /etc/v2ray-agent/tls/acme.log >/dev/null
     else
         echoContent green " ---> 生成证书中"
+        resetIncompleteAcmeDomain "${tlsDomain}"
+        if ! ensureAcmeStandalonePort; then
+            return 1
+        fi
         sudo "$HOME/.acme.sh/acme.sh" --issue -d "${tlsDomain}" --standalone -k ec-256 --server "${sslType}" ${sslIPv6} 2>&1 | tee -a /etc/v2ray-agent/tls/acme.log >/dev/null
     fi
 }
@@ -2306,11 +2334,11 @@ installTLS() {
 
         switchSSLType
         customSSLEmail
-        selectAcmeInstallSSL
+        selectAcmeInstallSSL || return 1
 
         if [[ "${installedDNSAPIStatus}" == "true" ]]; then
             sudo "$HOME/.acme.sh/acme.sh" --installcert -d "*.${dnsTLSDomain}" --fullchainpath "/etc/v2ray-agent/tls/${tlsDomain}.crt" --keypath "/etc/v2ray-agent/tls/${tlsDomain}.key" --ecc >/dev/null
-        else
+        elif [[ -s "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.key" && -s "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.cer" ]]; then
             sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${tlsDomain}" --fullchainpath "/etc/v2ray-agent/tls/${tlsDomain}.crt" --keypath "/etc/v2ray-agent/tls/${tlsDomain}.key" --ecc >/dev/null
         fi
 
@@ -2517,15 +2545,36 @@ handleNginx() {
         fi
         echoContent green " ---> Nginx启动成功"
     elif [[ "$1" == "stop" ]]; then
-        if ! "${nginxStatus[@]}" >/dev/null 2>&1; then
+        if ! "${nginxStatus[@]}" >/dev/null 2>&1 && ! pgrep -x nginx >/dev/null 2>&1; then
             return 0
         fi
-        if ! "${nginxStop[@]}"; then
-            echoContent red " ---> Nginx关闭失败，请检查宿主机服务状态"
-            return 1
+        "${nginxStop[@]}" >/dev/null 2>&1 || true
+        if command -v nginx >/dev/null 2>&1; then
+            nginx -s stop >/dev/null 2>&1 || true
         fi
-        if "${nginxStatus[@]}" >/dev/null 2>&1; then
-            echoContent red " ---> Nginx仍在运行，请检查宿主机服务状态"
+
+        local retry nginxPids
+        for retry in 1 2 3 4 5; do
+            if ! pgrep -x nginx >/dev/null 2>&1 && ! "${nginxStatus[@]}" >/dev/null 2>&1; then
+                echoContent green " ---> Nginx关闭成功"
+                return 0
+            fi
+            sleep 1
+        done
+
+        nginxPids=$(pgrep -x nginx || true)
+        if [[ -n "${nginxPids}" ]]; then
+            kill ${nginxPids} >/dev/null 2>&1 || true
+            sleep 1
+            nginxPids=$(pgrep -x nginx || true)
+            if [[ -n "${nginxPids}" ]]; then
+                kill -9 ${nginxPids} >/dev/null 2>&1 || true
+                sleep 1
+            fi
+        fi
+
+        if pgrep -x nginx >/dev/null 2>&1 || "${nginxStatus[@]}" >/dev/null 2>&1; then
+            echoContent red " ---> Nginx关闭失败，请检查宿主机服务状态"
             return 1
         fi
         echoContent green " ---> Nginx关闭成功"
@@ -9927,29 +9976,57 @@ sniffer:
 
 dns:
   enable: true
-  prefer-h3: false
   listen: 0.0.0.0:1053
   ipv6: true
+  use-system-hosts: false
+  cache-algorithm: arc
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
-    - '*.lan'
-    - '*.local'
-    - 'dns.google'
+    - "+.lan"
+    - "+.local"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
     - "localhost.ptlogin2.qq.com"
-  use-hosts: true
-  nameserver:
-    - https://1.1.1.1/dns-query
-    - https://8.8.8.8/dns-query
+    - "localhost.sec.qq.com"
+    - "localhost.work.weixin.qq.com"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
     - 1.1.1.1
     - 8.8.8.8
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+    - https://doh.360.cn/dns-query
+    - https://1.1.1.1/dns-query
+    - https://1.0.0.1/dns-query
+    - https://208.67.222.222/dns-query
+    - https://208.67.220.220/dns-query
+    - https://194.242.2.2/dns-query
+    - https://194.242.2.3/dns-query
   proxy-server-nameserver:
-    - https://223.5.5.5/dns-query
-    - https://1.12.12.12/dns-query
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+    - https://doh.360.cn/dns-query
+    - https://1.1.1.1/dns-query
+    - https://1.0.0.1/dns-query
+    - https://208.67.222.222/dns-query
+    - https://208.67.220.220/dns-query
+    - https://194.242.2.2/dns-query
+    - https://194.242.2.3/dns-query
   nameserver-policy:
-    "geosite:cn,private":
-      - https://doh.pub/dns-query
+    "geosite:private,cn,geolocation-cn":
       - https://dns.alidns.com/dns-query
+      - https://doh.pub/dns-query
+      - https://doh.360.cn/dns-query
+    "geosite:google,youtube,telegram,gfw,geolocation-!cn":
+      - https://1.1.1.1/dns-query
+      - https://1.0.0.1/dns-query
+      - https://208.67.222.222/dns-query
+      - https://208.67.220.220/dns-query
+      - https://194.242.2.2/dns-query
+      - https://194.242.2.3/dns-query
 
 proxy-providers:
   ${subscribeSalt}_provider:
@@ -9964,307 +10041,269 @@ proxy-providers:
       interval: 300
 
 proxy-groups:
-  - name: 手动切换
+  - name: 节点选择
     type: select
+    interval: 300
+    timeout: 3000
+    url: https://www.google.com/generate_204
+    lazy: true
+    max-failed-times: 3
+    hidden: false
     use:
       - ${subscribeSalt}_provider
-    proxies: null
-  - name: 自动选择
-    type: url-test
-    url: https://cp.cloudflare.com/generate_204
-    interval: 36000
-    tolerance: 50
-    use:
-      - ${subscribeSalt}_provider
-    proxies: null
-
-  - name: 全球代理
+    include-all: true
+    icon: "https://fastly.jsdelivr.net/gh/clash-verge-rev/clash-verge-rev.github.io@main/docs/assets/icons/adjust.svg"
+  - name: Claude
     type: select
-    use:
-      - ${subscribeSalt}_provider
+    interval: 300
+    timeout: 3000
+    url: https://www.google.com/generate_204
+    lazy: true
+    max-failed-times: 3
+    hidden: false
     proxies:
-      - 手动切换
-      - 自动选择
-
-  - name: 流媒体
-    type: select
+      - REJECT
+      - 节点选择
     use:
       - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-      - DIRECT
-  - name: DNS_Proxy
+    include-all-proxies: true
+    filter: '^f4675880-singbox_hysteria2$'
+    default-selected: f4675880-singbox_hysteria2
+    empty-fallback: REJECT
+  - name: 微软服务
     type: select
-    use:
-      - ${subscribeSalt}_provider
+    interval: 300
+    timeout: 3000
+    url: https://www.google.com/generate_204
+    lazy: true
+    max-failed-times: 3
+    hidden: false
     proxies:
-      - 自动选择
-      - 手动切换
-      - DIRECT
-
-  - name: Telegram
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-  - name: Google
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-      - DIRECT
-  - name: YouTube
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-  - name: Netflix
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 流媒体
-      - 手动切换
-      - 自动选择
-  - name: Spotify
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 流媒体
-      - 手动切换
-      - 自动选择
-      - DIRECT
-  - name: HBO
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 流媒体
-      - 手动切换
-      - 自动选择
-  - name: Bing
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-
-
-  - name: OpenAI
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-
-  - name: ClaudeAI
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-
-  - name: Disney
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 流媒体
-      - 手动切换
-      - 自动选择
-  - name: GitHub
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - 手动切换
-      - 自动选择
-      - DIRECT
-
-  - name: 国内媒体
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - DIRECT
-  - name: 本地直连
-    type: select
-    use:
-      - ${subscribeSalt}_provider
-    proxies:
-      - DIRECT
-      - 自动选择
+      - 全局直连
+      - 节点选择
+    icon: "https://fastly.jsdelivr.net/gh/clash-verge-rev/clash-verge-rev.github.io@main/docs/assets/icons/microsoft.svg"
   - name: 漏网之鱼
     type: select
-    use:
-      - ${subscribeSalt}_provider
+    interval: 300
+    timeout: 3000
+    url: https://www.google.com/generate_204
+    lazy: true
+    max-failed-times: 3
+    hidden: false
+    proxies:
+      - 节点选择
+      - DIRECT
+    icon: "https://fastly.jsdelivr.net/gh/clash-verge-rev/clash-verge-rev.github.io@main/docs/assets/icons/fish.svg"
+  - name: 谷歌服务
+    type: select
+    interval: 300
+    timeout: 3000
+    url: https://www.google.com/generate_204
+    lazy: true
+    max-failed-times: 3
+    hidden: false
+    proxies:
+      - 节点选择
+      - 全局直连
+    icon: "https://fastly.jsdelivr.net/gh/clash-verge-rev/clash-verge-rev.github.io@main/docs/assets/icons/google.svg"
+  - name: 国外媒体
+    type: select
+    interval: 300
+    timeout: 3000
+    url: https://www.google.com/generate_204
+    lazy: true
+    max-failed-times: 3
+    hidden: false
+    proxies:
+      - 节点选择
+      - 全局直连
+    icon: "https://fastly.jsdelivr.net/gh/clash-verge-rev/clash-verge-rev.github.io@main/docs/assets/icons/youtube.svg"
+  - name: 苹果服务
+    type: select
+    interval: 300
+    timeout: 3000
+    url: https://www.google.com/generate_204
+    lazy: true
+    max-failed-times: 3
+    hidden: false
+    proxies:
+      - 节点选择
+      - 全局直连
+    icon: "https://fastly.jsdelivr.net/gh/clash-verge-rev/clash-verge-rev.github.io@main/docs/assets/icons/apple.svg"
+  - name: 广告过滤
+    type: select
+    interval: 300
+    timeout: 3000
+    url: https://www.google.com/generate_204
+    lazy: true
+    max-failed-times: 3
+    hidden: false
+    proxies:
+      - REJECT
+      - DIRECT
+    icon: "https://fastly.jsdelivr.net/gh/clash-verge-rev/clash-verge-rev.github.io@main/docs/assets/icons/bug.svg"
+  - name: 全局直连
+    type: select
+    interval: 300
+    timeout: 3000
+    url: https://www.google.com/generate_204
+    lazy: true
+    max-failed-times: 3
+    hidden: false
     proxies:
       - DIRECT
-      - 手动切换
-      - 自动选择
+    icon: "https://fastly.jsdelivr.net/gh/clash-verge-rev/clash-verge-rev.github.io@main/docs/assets/icons/link.svg"
+  - name: 全局拦截
+    type: select
+    interval: 300
+    timeout: 3000
+    url: https://www.google.com/generate_204
+    lazy: true
+    max-failed-times: 3
+    hidden: false
+    proxies:
+      - REJECT
+      - DIRECT
+    icon: "https://fastly.jsdelivr.net/gh/clash-verge-rev/clash-verge-rev.github.io@main/docs/assets/icons/block.svg"
 rule-providers:
-  lan:
-    type: http
-    behavior: classical
-    interval: 86400
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Lan/Lan.yaml
-    path: ./Rules/lan.yaml
   reject:
     type: http
+    format: yaml
     behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/reject.txt
-    path: ./ruleset/reject.yaml
     interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt
+    path: ./ruleset/loyalsoldier/reject.yaml
+  icloud:
+    type: http
+    format: yaml
+    behavior: domain
+    interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/icloud.txt
+    path: ./ruleset/loyalsoldier/icloud.yaml
+  apple:
+    type: http
+    format: yaml
+    behavior: domain
+    interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/apple.txt
+    path: ./ruleset/loyalsoldier/apple.yaml
+  google:
+    type: http
+    format: yaml
+    behavior: domain
+    interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/google.txt
+    path: ./ruleset/loyalsoldier/google.yaml
   proxy:
     type: http
+    format: yaml
     behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/proxy.txt
-    path: ./ruleset/proxy.yaml
     interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt
+    path: ./ruleset/loyalsoldier/proxy.yaml
   direct:
     type: http
+    format: yaml
     behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/direct.txt
-    path: ./ruleset/direct.yaml
     interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/direct.txt
+    path: ./ruleset/loyalsoldier/direct.yaml
   private:
     type: http
+    format: yaml
     behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/private.txt
-    path: ./ruleset/private.yaml
     interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt
+    path: ./ruleset/loyalsoldier/private.yaml
   gfw:
     type: http
+    format: yaml
     behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/gfw.txt
-    path: ./ruleset/gfw.yaml
     interval: 86400
-  greatfire:
-    type: http
-    behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/greatfire.txt
-    path: ./ruleset/greatfire.yaml
-    interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt
+    path: ./ruleset/loyalsoldier/gfw.yaml
   tld-not-cn:
     type: http
+    format: yaml
     behavior: domain
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/tld-not-cn.txt
-    path: ./ruleset/tld-not-cn.yaml
     interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/tld-not-cn.txt
+    path: ./ruleset/loyalsoldier/tld-not-cn.yaml
   telegramcidr:
     type: http
+    format: yaml
     behavior: ipcidr
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/telegramcidr.txt
-    path: ./ruleset/telegramcidr.yaml
     interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/telegramcidr.txt
+    path: ./ruleset/loyalsoldier/telegramcidr.yaml
+  cncidr:
+    type: http
+    format: yaml
+    behavior: ipcidr
+    interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt
+    path: ./ruleset/loyalsoldier/cncidr.yaml
+  lancidr:
+    type: http
+    format: yaml
+    behavior: ipcidr
+    interval: 86400
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/lancidr.txt
+    path: ./ruleset/loyalsoldier/lancidr.yaml
   applications:
     type: http
+    format: yaml
     behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/applications.txt
-    path: ./ruleset/applications.yaml
     interval: 86400
-  Disney:
+    url: https://fastly.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt
+    path: ./ruleset/loyalsoldier/applications.yaml
+  openai:
     type: http
+    format: yaml
     behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Disney/Disney.yaml
-    path: ./ruleset/disney.yaml
     interval: 86400
-  Netflix:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Netflix/Netflix.yaml
-    path: ./ruleset/netflix.yaml
-    interval: 86400
-  YouTube:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/YouTube/YouTube.yaml
-    path: ./ruleset/youtube.yaml
-    interval: 86400
-  HBO:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/HBO/HBO.yaml
-    path: ./ruleset/hbo.yaml
-    interval: 86400
-  OpenAI:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/OpenAI/OpenAI.yaml
-    path: ./ruleset/openai.yaml
-    interval: 86400
-  ClaudeAI:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Claude/Claude.yaml
-    path: ./ruleset/claudeai.yaml
-    interval: 86400
-  Bing:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Bing/Bing.yaml
-    path: ./ruleset/bing.yaml
-    interval: 86400
-  Google:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Google/Google.yaml
-    path: ./ruleset/google.yaml
-    interval: 86400
-  GitHub:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/GitHub/GitHub.yaml
-    path: ./ruleset/github.yaml
-    interval: 86400
-  Spotify:
-    type: http
-    behavior: classical
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Spotify/Spotify.yaml
-    path: ./ruleset/spotify.yaml
-    interval: 86400
-  ChinaMaxDomain:
-    type: http
-    behavior: domain
-    interval: 86400
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaMax/ChinaMax_Domain.yaml
-    path: ./Rules/ChinaMaxDomain.yaml
-  ChinaMaxIPNoIPv6:
-    type: http
-    behavior: ipcidr
-    interval: 86400
-    url: https://gh-proxy.com/https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaMax/ChinaMax_IP_No_IPv6.yaml
-    path: ./Rules/ChinaMaxIPNoIPv6.yaml
+    url: https://fastly.jsdelivr.net/gh/blackmatrix7/ios_rule_script@master/rule/Clash/OpenAI/OpenAI.yaml
+    path: ./ruleset/blackmatrix7/openai.yaml
 rules:
-  - RULE-SET,YouTube,YouTube,no-resolve
-  - RULE-SET,Google,Google,no-resolve
-  - RULE-SET,GitHub,GitHub
-  - RULE-SET,telegramcidr,Telegram,no-resolve
-  - RULE-SET,Spotify,Spotify,no-resolve
-  - RULE-SET,Netflix,Netflix
-  - RULE-SET,HBO,HBO
-  - RULE-SET,Bing,Bing
-  - RULE-SET,OpenAI,OpenAI
-  - RULE-SET,ClaudeAI,ClaudeAI
-  - RULE-SET,Disney,Disney
-  - RULE-SET,proxy,全球代理
-  - RULE-SET,gfw,全球代理
-  - RULE-SET,applications,本地直连
-  - RULE-SET,ChinaMaxDomain,本地直连
-  - RULE-SET,ChinaMaxIPNoIPv6,本地直连,no-resolve
-  - RULE-SET,lan,本地直连,no-resolve
-  - GEOIP,CN,本地直连
+  - DOMAIN-SUFFIX,anthropic.com,Claude
+  - DOMAIN-SUFFIX,claude.ai,Claude
+  - DOMAIN-SUFFIX,claude.com,Claude
+  - DOMAIN-SUFFIX,claudeusercontent.com,Claude
+  - DOMAIN-SUFFIX,claudemcpcontent.com,Claude
+  - DOMAIN-SUFFIX,intercomcdn.com,Claude
+  - DOMAIN-SUFFIX,facebook.net,Claude
+  - DOMAIN-SUFFIX,snapcraft.io,Claude
+  - DOMAIN-SUFFIX,intercom.io,Claude
+  - DOMAIN-SUFFIX,ubuntu.com,Claude
+  - DOMAIN-SUFFIX,sentry.io,Claude
+  - DOMAIN-SUFFIX,githubusercontent.com,Claude
+  - DOMAIN-SUFFIX,datadoghq.com,Claude
+  - DOMAIN,http-intake.logs.us5.datadoghq.com,Claude
+  - DOMAIN,browser-intake-us5-datadoghq.com,Claude
+  - DOMAIN-SUFFIX,googleapis.cn,节点选择
+  - DOMAIN-SUFFIX,gstatic.com,节点选择
+  - DOMAIN-SUFFIX,xn--ngstr-lra8j.com,节点选择
+  - DOMAIN-SUFFIX,github.io,节点选择
+  - DOMAIN,v2rayse.com,节点选择
+  - DOMAIN-KEYWORD,codefather,全局直连
+  - DOMAIN-KEYWORD,mianshiya,全局直连
+  - DOMAIN-KEYWORD,codecopy,全局直连
+  - RULE-SET,openai,节点选择
+  - RULE-SET,applications,全局直连
+  - RULE-SET,private,全局直连
+  - RULE-SET,reject,广告过滤
+  - RULE-SET,icloud,微软服务
+  - RULE-SET,apple,节点选择
+  - RULE-SET,google,节点选择
+  - RULE-SET,proxy,节点选择
+  - RULE-SET,gfw,节点选择
+  - RULE-SET,tld-not-cn,节点选择
+  - RULE-SET,direct,全局直连
+  - RULE-SET,lancidr,全局直连,no-resolve
+  - RULE-SET,cncidr,全局直连,no-resolve
+  - RULE-SET,telegramcidr,节点选择,no-resolve
+  - GEOIP,LAN,全局直连,no-resolve
+  - GEOIP,CN,全局直连,no-resolve
   - MATCH,漏网之鱼
 EOF
 
