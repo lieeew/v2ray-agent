@@ -9738,6 +9738,22 @@ viewAccountsByUser() {
     )
 }
 
+# 打印订阅链接、在线二维码和终端二维码。email 为空时不输出账号行。
+printSubscribeDetail() {
+    local title=$1
+    local url=$2
+    local email=$3
+    echoContent skyBlue "\n----------${title}----------\n"
+    if [[ -n "${email}" ]]; then
+        echoContent green "email:${email}\n"
+    fi
+    echoContent yellow "url:${url}\n"
+    echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${url}\n"
+    if [[ "${release}" != "alpine" ]]; then
+        echo "${url}" | qrencode -s 10 -m 1 -t UTF8
+    fi
+}
+
 viewSubscriptionByUser() {
     readInstallType
     local users
@@ -9748,7 +9764,7 @@ viewSubscriptionByUser() {
         echoContent red " ---> 尚未初始化订阅服务，请先使用 6.生成/更新订阅。"
         return 1
     fi
-    local subscribeSalt emailMd5 currentDomain publishDir format file formatFound=false
+    local subscribeSalt emailMd5 currentDomain publishDir format file url formatFound=false
     subscribeSalt=$(cat /etc/v2ray-agent/subscribe_local/subscribeSalt) || return 1
     emailMd5=$(printf '%s\n' "${accountSelectionKey}${subscribeSalt}" | md5sum | awk '{print $1}')
     currentDomain=${currentHost}
@@ -9766,13 +9782,24 @@ viewSubscriptionByUser() {
         file="${publishDir}/${format}/${emailMd5}"
         [[ -s "${file}" ]] || continue
         case "${format}" in
-        default) echoContent yellow "默认订阅: ${subscribeType}://${currentDomain}/s/default/${emailMd5}" ;;
-        clashMetaProfiles) echoContent yellow "Mihomo 订阅: ${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" ;;
-        sing-box) echoContent yellow "sing-box 订阅: ${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}" ;;
+        default)
+            url="${subscribeType}://${currentDomain}/s/default/${emailMd5}"
+            printSubscribeDetail "默认订阅" "${url}" "${accountSelectionKey}"
+            ;;
+        clashMetaProfiles)
+            url="${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}"
+            printSubscribeDetail "clashMeta订阅" "${url}"
+            ;;
+        sing-box)
+            url="${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
+            printSubscribeDetail "sing-box订阅" "${url}"
+            ;;
         esac
         formatFound=true
     done
-    if [[ "${formatFound}" != true ]]; then
+    if [[ "${formatFound}" == true ]]; then
+        echoContent skyBlue "--------------------------------------------------------------"
+    else
         echoContent yellow " ---> 该用户尚无已生成的订阅文件，请先使用 6.生成/更新订阅。"
         return 1
     fi
@@ -10398,13 +10425,7 @@ subscribe() {
                     fi
                 fi
                 if [[ -z "${showStatus}" ]]; then
-                    echoContent skyBlue "\n----------默认订阅----------\n"
-                    echoContent green "email:${email}\n"
-                    echoContent yellow "url:${subscribeType}://${currentDomain}/s/default/${emailMd5}\n"
-                    echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/default/${emailMd5}\n"
-                    if [[ "${release}" != "alpine" ]]; then
-                        echo "${subscribeType}://${currentDomain}/s/default/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                    fi
+                    printSubscribeDetail "默认订阅" "${subscribeType}://${currentDomain}/s/default/${emailMd5}" "${email}"
 
                     # clashMeta
                     if [[ -f "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
@@ -10415,12 +10436,7 @@ subscribe() {
 
                         local clashProxyUrl="${subscribeType}://${currentDomain}/s/clashMeta/${emailMd5}"
                         clashMetaConfig "${clashProxyUrl}" "${emailMd5}"
-                        echoContent skyBlue "\n----------clashMeta订阅----------\n"
-                        echoContent yellow "url:${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
-                        echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
-                        if [[ "${release}" != "alpine" ]]; then
-                            echo "${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                        fi
+                        printSubscribeDetail "clashMeta订阅" "${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}"
 
                     fi
                     # sing-box
@@ -10437,12 +10453,7 @@ subscribe() {
                         jq ".outbounds=$(jq ".outbounds|map(if has(\"outbounds\") then .outbounds += $(jq ".|map(.tag)" "/etc/v2ray-agent/subscribe_local/sing-box/${email}") else . end)" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
                         jq ".outbounds += $(jq '.' "/etc/v2ray-agent/subscribe_local/sing-box/${email}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
 
-                        echoContent skyBlue "\n----------sing-box订阅----------\n"
-                        echoContent yellow "url:${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
-                        echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
-                        if [[ "${release}" != "alpine" ]]; then
-                            echo "${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                        fi
+                        printSubscribeDetail "sing-box订阅" "${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
 
                     fi
 
@@ -11051,17 +11062,7 @@ menu() {
     echoContent green "描述：八合一共存脚本\c"
     showInstallStatus
     checkWgetShowProgress
-    echoContent red "\n=========================== 推广区============================"
-    echoContent red "                                              "
-    echoContent yellow "VPS选购攻略"
-    echoContent green "https://www.v2ray-agent.com/archives/1679975663984"
-    echoContent yellow "年付10美金低价VPS AS4837"
-    echoContent green "https://www.v2ray-agent.com/archives/racknerdtao-can-zheng-li-nian-fu-10mei-yuan"
-    echoContent yellow "优质常驻套餐DMIT CN2-GIA"
-    echoContent green "https://www.v2ray-agent.com/archives/186cee7b-9459-4e57-b9b2-b07a4f36931c"
-    echoContent yellow "VPS探针：https://ping.v2ray-agent.com/"
-    echoContent red "                                              "
-    echoContent red "=============================================================="
+    echoContent red "\n=============================================================="
     if [[ -n "${coreInstallType}" ]]; then
         echoContent yellow "1.重新安装"
     else

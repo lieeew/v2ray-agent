@@ -10271,6 +10271,22 @@ viewAccountsByUser() {
     )
 }
 
+# Print the subscription URL, online QR code, and terminal QR code. Skip the account line when email is empty.
+printSubscribeDetail() {
+    local title=$1
+    local url=$2
+    local email=$3
+    echoContent skyBlue "\n----------${title}----------\n"
+    if [[ -n "${email}" ]]; then
+        echoContent green "email:${email}\n"
+    fi
+    echoContent yellow "url:${url}\n"
+    echoContent yellow " Online QR code :https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${url}\n"
+    if [[ "${release}" != "alpine" ]]; then
+        echo "${url}" | qrencode -s 10 -m 1 -t UTF8
+    fi
+}
+
 viewSubscriptionByUser() {
     readInstallType
     local users
@@ -10281,7 +10297,7 @@ viewSubscriptionByUser() {
         echoContent red " ---> Subscription service is not initialized. Use 6.Generate/update subscriptions first."
         return 1
     fi
-    local subscribeSalt emailMd5 currentDomain publishDir format file formatFound=false
+    local subscribeSalt emailMd5 currentDomain publishDir format file url formatFound=false
     subscribeSalt=$(cat /etc/v2ray-agent/subscribe_local/subscribeSalt) || return 1
     emailMd5=$(printf '%s\n' "${accountSelectionKey}${subscribeSalt}" | md5sum | awk '{print $1}')
     currentDomain=${currentHost}
@@ -10299,13 +10315,24 @@ viewSubscriptionByUser() {
         file="${publishDir}/${format}/${emailMd5}"
         [[ -s "${file}" ]] || continue
         case "${format}" in
-        default) echoContent yellow "Default subscription: ${subscribeType}://${currentDomain}/s/default/${emailMd5}" ;;
-        clashMetaProfiles) echoContent yellow "Mihomo subscription: ${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" ;;
-        sing-box) echoContent yellow "sing-box subscription: ${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}" ;;
+        default)
+            url="${subscribeType}://${currentDomain}/s/default/${emailMd5}"
+            printSubscribeDetail "Default subscription" "${url}" "${accountSelectionKey}"
+            ;;
+        clashMetaProfiles)
+            url="${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}"
+            printSubscribeDetail "clashMeta subscription" "${url}"
+            ;;
+        sing-box)
+            url="${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
+            printSubscribeDetail "sing-box subscription" "${url}"
+            ;;
         esac
         formatFound=true
     done
-    if [[ "${formatFound}" != true ]]; then
+    if [[ "${formatFound}" == true ]]; then
+        echoContent skyBlue "--------------------------------------------------------------"
+    else
         echoContent yellow " ---> No subscription files exist for this user. Use 6.Generate/update subscriptions first."
         return 1
     fi
@@ -10391,13 +10418,7 @@ subscribe() {
                     fi
                 fi
                 if [[ -z "${showStatus}" ]]; then
-                    echoContent skyBlue "\n----------Default subscription----------\n"
-                    echoContent green "email:${email}\n"
-                    echoContent yellow "url:${subscribeType}://${currentDomain}/s/default/${emailMd5}\n"
-                    echoContent yellow " Online QR code :https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/default/${emailMd5}\n"
-                    if [[ "${release}" != "alpine" ]]; then
-                        echo "${subscribeType}://${currentDomain}/s/default/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                    fi
+                    printSubscribeDetail "Default subscription" "${subscribeType}://${currentDomain}/s/default/${emailMd5}" "${email}"
 
                 #clashMeta
                     if [[ -f "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
@@ -10408,12 +10429,7 @@ subscribe() {
 
                         local clashProxyUrl="${subscribeType}://${currentDomain}/s/clashMeta/${emailMd5}"
                         clashMetaConfig "${clashProxyUrl}" "${emailMd5}"
-                        echoContent skyBlue "\n----------clashMeta subscription----------\n"
-                        echoContent yellow "url:${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
-                        echoContent yellow " Online QR code :https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
-                        if [[ "${release}" != "alpine" ]]; then
-                            echo "${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                        fi
+                        printSubscribeDetail "clashMeta subscription" "${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}"
 
                     fi
                     # sing-box
@@ -10430,12 +10446,7 @@ subscribe() {
                         jq ".outbounds=$(jq ".outbounds|map(if has(\"outbounds\") then .outbounds += $(jq ".|map(.tag)" "/etc/v2ray-agent/subscribe_local/sing-box/${email}") else . end)" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
                         jq ".outbounds += $(jq '.' "/etc/v2ray-agent/subscribe_local/sing-box/${email}")" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}" >"/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" && mv "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}_tmp" "/etc/v2ray-agent/subscribe/sing-box/${emailMd5}"
 
-                        echoContent skyBlue "\n----------sing-box subscription ----------\n"
-                        echoContent yellow "url:${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
-                        echoContent yellow " Online QR code :https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
-                        if [[ "${release}" != "alpine" ]]; then
-                            echo "${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                        fi
+                        printSubscribeDetail "sing-box subscription" "${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
 
                     fi
 
@@ -11044,17 +11055,7 @@ menu() {
     echoContent green "Description: 8-in-1 coexistence script\c"
     showInstallStatus
     checkWgetShowProgress
-    echoContent red "\n============================ Promotion area================ ============"
-    echoContent red "                                              "
-    echoContent yellow "VPS buying guide "
-    echoContent green "https://www.v2ray-agent.com/archives/1679975663984"
-    echoContent yellow " Annual 10 USD budget VPS AS4837"
-    echoContent green "https://www.v2ray-agent.com/archives/racknerdtao-can-zheng-li-nian-fu-10mei-yuan"
-    echoContent yellow " Premium standard plans DMIT CN2-GIA"
-    echoContent green "https://www.v2ray-agent.com/archives/186cee7b-9459-4e57-b9b2-b07a4f36931c"
-    echoContent yellow "VPS probe : https://ping.v2ray-agent.com/"
-    echoContent red "                                              "
-    echoContent red "=============================================================="
+    echoContent red "\n=============================================================="
     if [[ -n "${coreInstallType}" ]]; then
         echoContent yellow "1.Reinstall"
     else
